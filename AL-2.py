@@ -1,0 +1,329 @@
+# Импорт стандартных и сторонних библиотек
+import os               # Работа с путями к файлам и папкам
+import sys              # Для аварийного завершения программы при ошибках (sys.exit)
+import json             # Парсинг JSON-ответов от Vosk (результаты распознавания)
+import time             # Замеры времени загрузки модели, небольшие паузы
+import pyaudio          # Библиотека для захвата звука с микрофона
+from vosk import Model, KaldiRecognizer   # Основные классы Vosk для оффлайн-распознавания
+import pyttsx3          # Оффлайн-синтез речи (text-to-speech), работает без интернета
+import queue            # Очередь для аудио-данных
+import webbrowser
+from urllib.parse import quote       # для безопасного кодирования запроса
+
+# ================================================
+# Шаг 1: Настройка путей (динамические, работают в Spyder, cmd, exe)
+# ================================================
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))  # Папка, где лежит скрипт
+MODEL_PATH = os.path.join(SCRIPT_DIR, "model", "vosk-model-ru-0.22")  # Путь к модели Vosk
+
+SAMPLE_RATE = 16000
+CHUNK_SIZE = 8000       # frames_per_buffer в pyaudio (было 4000, но 8000 чаще используется)
+
+
+
+
+
+# ================================================
+# Шаг 2: Проверка модели Vosk
+# ================================================
+critical_file = os.path.join(MODEL_PATH, "am", "final.mdl")
+
+
+#------TEST
+if not os.path.exists(critical_file):
+    print("Ошибка: модель не найдена по пути:", MODEL_PATH)
+    print("Содержимое папки проекта:", os.listdir(SCRIPT_DIR))
+    sys.exit(1)
+#------TEST
+
+#------TEST
+print("Загружаю модель Vosk... ", end="", flush=True)
+
+#------TEST
+
+
+start = time.time()
+try:
+    model = Model(MODEL_PATH)
+    print(f"OK ({time.time() - start:.1f} сек)")
+except Exception as e:
+    print(f"Ошибка загрузки модели: {e}")
+    sys.exit(1)
+
+rec = KaldiRecognizer(model, SAMPLE_RATE)
+rec.SetWords(True)
+
+
+
+# ================================================
+# Инициализация PyAudio и очереди
+# ================================================
+p = pyaudio.PyAudio()
+audio_queue = queue.Queue()     # очередь для аудио-чанков (bytes)
+
+
+# Фуекция потоковой записи с микрофона 
+def audio_callback(in_data, frame_count, time_info, status): # in_data - Сырые аудиоданные; frame_count - Количество фреймов (не байт!) в этом чанке, time_info - Словарь с временными метками (время ввода, вывода, текущего момента), status - Статус потока (ошибки, переполнение, underflow и т.д.) — 0 = всё нормально
+    """Callback-функция PyAudio — кладёт чанки в очередь"""
+    if status:
+        print(status, file=sys.stderr) # Выводит ошибку/статус, если он есть
+    audio_queue.put(in_data)        # in_data — это уже bytes Самое главное действие: кладёт полученный кусок аудио в очередь
+    return (None, pyaudio.paContinue)   # продолжаем запись если ошибок нет 
+
+
+# Открываем поток в non-blocking режиме с callback
+stream = p.open(
+    format=pyaudio.paInt16,          # 16-битные сэмплы (самый популярный формат)
+    channels=1,                      # моно (один канал)
+    rate=SAMPLE_RATE,                # частота дискретизации 16000 Гц
+    input=True,                      # ← это запись (input stream), а не воспроизведение
+    frames_per_buffer=CHUNK_SIZE,    # размер одного чанка в фреймах 8000
+    stream_callback=audio_callback   # ← callback-функция, которая будет вызываться автоматически
+)
+
+# Запускаем поток (non-blocking)
+stream.start_stream()
+
+
+#------TEST
+print("Микрофон запущен (callback-режим)")
+#------TEST
+
+
+
+
+
+
+
+
+# ────────────────────────────────────────────────
+# Функция для озвучивания текста 
+# ────────────────────────────────────────────────
+
+def speak(text: str, rate: int = 150, volume: float = 0.6) -> None: # rate - скорость речи, volume - громкость
+    global stream, audio_queue
+    if not text.strip():
+        return
+
+    print(f"AL: {text}")# Вывод текста
+
+    try:
+        # ОСТАНАВЛИВАЕМ ЗАПИСЬ, чтобы не слышать самого себя
+        if stream.is_active():
+            stream.stop_stream()
+        
+        # Очищаем очередь от накопившихся данных
+        while not audio_queue.empty():
+            try:
+                audio_queue.get_nowait()
+            except queue.Empty:
+                break
+        
+        engine = pyttsx3.init() # Инициализация синтезатора речи
+        engine.setProperty('rate', rate) # Установка скорости речи
+        engine.setProperty('volume', volume) # Установка громкости
+
+        voices = engine.getProperty('voices') # Получение списка доступных голосов
+        selected_voice = None # Инициализация выбранного голоса
+
+        for voice in voices:
+            name_lower = voice.name.lower() # Преобразование имени голоса в нижний регистр
+            if "aleksandr" in name_lower or "александр" in name_lower: # Проверка на наличие имени голоса в списке доступных голосов
+                selected_voice = voice.id # Установка выбранного голоса
+                break
+
+        if selected_voice is None: # Если выбранный голос не найден, то используем первый доступный голос
+            for voice in voices:
+                if "ru" in "".join(voice.languages).lower() or "russian" in voice.name.lower(): # Проверка на наличие языка голоса в списке доступных языков
+                    selected_voice = voice.id # Установка выбранного голоса
+                    break
+
+        if selected_voice:
+            engine.setProperty('voice', selected_voice) # Установка выбранного голоса
+            print(f"   Использован голос: {voice.name} ({voice.id})") # Вывод информации о выбранном голосе
+        else:
+            print("   Русский голос не найден → дефолт") # Вывод информации о том, что русский голос не найден
+
+        engine.say(text) # Сказать текст
+        engine.runAndWait() # Ожидание завершения синтеза
+        engine.stop() # Остановка синтезатора
+
+        # Небольшая пауза, чтобы звук точно прекратился
+        time.sleep(0.5)
+        
+        # ВОЗОБНОВЛЯЕМ ЗАПИСЬ после озвучивания
+        if not stream.is_active():
+            stream.start_stream()
+
+    except Exception as e:
+        print(f"[Ошибка TTS]: {e}") # Вывод информации о том, что произошла ошибка
+        # В случае ошибки всё равно возобновляем запись
+        if not stream.is_active():
+            stream.start_stream()
+
+
+
+
+
+
+
+
+
+# ────────────────────────────────────────────────
+# Константы для wake-word режима
+# ────────────────────────────────────────────────
+
+WAKE_UP = "Ал"
+TIME_OUT = 60.0
+MIN_WORD_LEN = 2
+
+activ = False
+last_spik = time.time()
+
+def process_text(text: str) -> bool:
+    text_l = text.lower().strip()
+    return WAKE_UP.lower() in text_l
+
+
+
+
+
+
+
+
+
+
+#────────────────────────────────────────────────
+# Функция для обработки команд
+#────────────────────────────────────────────────
+def handle_command(text: str) -> bool:
+    """
+    Обработка простых текстовых команд по ключевым словам.
+    Возвращает True, если команда была распознана и обработана.
+    """
+    text_l = text.lower().strip()
+
+
+
+#-------FOR ME 
+    # ─── Открыть браузер (просто пустую вкладку или домашнюю страницу) ───
+    if any(x in text_l for x in ["открой браузер", "открой chrome", "запусти браузер", "браузер открой"]):
+        webbrowser.open("https://yandex.ru/search/")          # или "" — откроет домашнюю страницу
+        # webbrowser.open_new_tab("https://www.google.com")  # если хочешь гарантированно новую вкладку
+        speak("Открываю")
+        return True
+    search_triggers = [
+        "найди", "погугли", "поиск", "найди в интернете", "покажи",
+        "что такое", "кто такой", "где находится", "сколько стоит"
+    ]
+
+    for trigger in search_triggers:
+        if trigger in text_l:
+            # отрезаем всё до и включая триггер
+            query_start = text_l.find(trigger) + len(trigger)
+            query = text_l[query_start:].strip()
+
+            if query:
+                encoded_query = quote(query)                       # "привет как дела" → "привет%20как%20дела"
+                search_url = f"https://yandex.ru/search/?text={encoded_query}"
+                webbrowser.open(search_url)
+                speak(f"Ищу: {query}")
+                return True
+            else:
+                speak("Что именно найти?")
+                return True
+#-------FOR ME //
+
+
+
+
+    # Примеры заранее заготовленных ответов
+    if "привет" in text_l:
+        speak("Слушаю")
+        return True
+
+    if "как дела" in text_l:
+        speak("Лучше небывает!")
+        return True
+
+    if "который час" in text_l or "сколько времени" in text_l or "время" in text_l:
+        now = time.localtime()
+        speak(f"Сейчас {now.tm_hour:02d}:{now.tm_min:02d}.")
+        return True
+
+    
+
+    return False
+3
+
+# ────────────────────────────────────────────────
+# Основной цикл
+# ────────────────────────────────────────────────
+#------TEST
+print(f"\nЗапущен режим ожидания. Произнеси '{WAKE_UP}' чтобы активировать")
+print(f"Таймаут молчания: {TIME_OUT} секунд\n")
+#------TEST
+
+#Запуск основного цикла
+try:
+    while True:
+        try:
+            data = audio_queue.get(timeout=0.1)     # неблокирующий get с таймаутом
+        except queue.Empty:
+            continue
+
+        if rec.AcceptWaveform(data):
+            result = json.loads(rec.Result())
+            text = result.get("text", "").strip()
+
+            if not text:
+                continue
+
+            print(f"→ {text}")
+
+            current_time = time.time()
+
+            if activ:
+                # Режим команд: сначала пытаемся распознать ключевые слова,
+                # иначе просто повторяем услышанную фразу.
+                if handle_command(text):
+                    last_spik = current_time
+                if text.lower() == "пока":
+                    speak("До встречи")
+                    break
+                else:
+                    print(f"Услышано: {text}")
+                    last_spik = current_time
+
+            else:
+                # Режим ожидания wake-word
+                if process_text(text):
+                    activ = True
+                    last_spik = current_time
+                    speak("Слушаю вас, сэр")
+                    print("→ Режим активен")
+                # else: игнорируем
+
+        else:
+            partial = json.loads(rec.PartialResult())
+            ptext = partial.get("partial", "").strip()
+            if ptext:
+                print(f"  ↳ {ptext}", end="\r", flush=True)
+
+        # Таймаут молчания
+        if activ and (time.time() - last_spik > TIME_OUT):
+            activ = False
+            speak("Я жду ключевого слова")
+            print("→ Возврат в режим ожидания wake-word")
+
+except KeyboardInterrupt:
+    speak("До свидания")
+
+finally:
+    print("Завершение программы...")
+    if stream is not None:
+        stream.stop_stream()
+        stream.close()
+    if p is not None:
+        p.terminate()
+    print("Ресурсы освобождены.")
